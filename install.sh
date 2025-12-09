@@ -1,6 +1,17 @@
 #!/bin/bash
 set -e
 
+APP_NAME="Navi"
+REPO_URL="https://github.com/romulorvs/Navi.git"
+INSTALL_DIR="/Applications"
+WORK_DIR=""
+SOURCE_DIR=""
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
 # Check macOS version (requires 12.0+)
 MACOS_VERSION=$(sw_vers -productVersion)
@@ -12,28 +23,61 @@ if [ "$MACOS_MAJOR" -lt 12 ]; then
     exit 1
 fi
 
-echo "Building Navi..."
+# Cleanup function
+cleanup() {
+    if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+        echo "Cleaning up temporary files..."
+        rm -rf "$WORK_DIR"
+    fi
+}
+
+# Ensure cleanup runs on exit (success or failure)
+trap cleanup EXIT
+
+echo -e "${BLUE}Starting Navi installation...${NC}"
+
+# Create temp working directory
+WORK_DIR=$(mktemp -d)
+SOURCE_DIR="$WORK_DIR/Navi"
+echo "Working in temporary directory: $WORK_DIR"
+
+# Check if we are in the repo directory by looking for required files
+if [ -f "Package.swift" ] && [ -f "icon.png" ] && [ -f "Info.plist" ] && [ -f "main.swift" ]; then
+    echo "Copying source files to temp directory..."
+    mkdir -p "$SOURCE_DIR"
+    rsync -a --exclude '.build' ./ "$SOURCE_DIR/"
+else
+    echo "Cloning Navi repository..."
+    git clone "$REPO_URL" "$SOURCE_DIR"
+fi
+
+cd "$SOURCE_DIR"
 
 swift build -c release \
     -Xswiftc -Osize \
     -Xswiftc -whole-module-optimization \
     -Xswiftc -enforce-exclusivity=unchecked
 
-APP_NAME="Navi"
-APP_DIR=".build/${APP_NAME}.app"
-CONTENTS_DIR="${APP_DIR}/Contents"
+BUILD_APP_DIR=".build/${APP_NAME}.app"
+CONTENTS_DIR="${BUILD_APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 
-rm -rf "${APP_DIR}"
+rm -rf "${BUILD_APP_DIR}"
 mkdir -p "${MACOS_DIR}"
 mkdir -p "${RESOURCES_DIR}"
 cp ".build/release/${APP_NAME}" "${MACOS_DIR}/"
 strip -x "${MACOS_DIR}/${APP_NAME}"
-cp "Info.plist" "${CONTENTS_DIR}/"
 
+# Handle Info.plist
+if [ -f "Info.plist" ]; then
+    cp "Info.plist" "${CONTENTS_DIR}/"
+else
+    echo "Warning: Info.plist not found."
+fi
+
+# Handle Icon
 if [ -f "icon.png" ]; then
-    echo "Generating app icon from icon.png..."
     cp "icon.png" "${RESOURCES_DIR}/"
     ICONSET_DIR=".build/AppIcon.iconset"
     rm -rf "${ICONSET_DIR}"
@@ -52,15 +96,15 @@ if [ -f "icon.png" ]; then
     
     iconutil -c icns "${ICONSET_DIR}" -o "${RESOURCES_DIR}/AppIcon.icns"
     rm -rf "${ICONSET_DIR}"
-    echo "App icon generated successfully"
 elif [ -f "AppIcon.icns" ]; then
     cp "AppIcon.icns" "${RESOURCES_DIR}/"
 fi
 
-echo "✅ Build complete: ${APP_DIR}"
-echo ""
-echo "To install, run:"
-echo "  cp -r \"${APP_DIR}\" /Applications/"
-echo ""
-echo "Or run directly:"
-echo "  open \"${APP_DIR}\""
+# 3. Install to /Applications
+echo -e "${BLUE}Installing to ${INSTALL_DIR}...${NC}"
+rm -rf "${INSTALL_DIR}/${APP_NAME}.app"
+cp -r "${BUILD_APP_DIR}" "${INSTALL_DIR}/"
+
+# 4. Execute with prompt for login items
+echo -e "${GREEN}Installation complete! Navi is running.${NC}"
+open "${INSTALL_DIR}/${APP_NAME}.app"

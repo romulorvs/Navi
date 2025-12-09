@@ -2,16 +2,18 @@
 import PackageDescription
 
 let package = Package(
-    name: "Twoggler",
+    name: "Navi",
     platforms: [
         .macOS(.v12)
     ],
     targets: [
         .executableTarget(
-            name: "Twoggler",
-            path: "Sources",
+            name: "Navi",
+            path: ".",
+            exclude: ["Info.plist", "build.sh", "install.sh", "README.md"],
+            sources: ["main.swift"],
             resources: [
-                .copy("../icon.png")
+                .copy("icon.png")
             ]
         )
     ]

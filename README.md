@@ -1,30 +1,34 @@
-# Twoggler - Alt+Tab alternative for MacOS
+# Navi - Alt+Tab alternative for MacOS
 
 <p align="center">
-  <img src=".github/icon.png" alt="Twoggler Logo" width="100"/>
+  <img src=".github/icon.png" alt="Navi Logo" width="100"/>
 </p>
 
 A simple macOS window switcher app similar to Windows alt+tab. Switch between **windows** (across all apps) using **Cmd+Tab**.
 
-Twoggler offers three display modes to suit your preference:
+> **Note:** This project was 100% created by AI as an experiment in AI-assisted software development.
+
+
+Navi offers three display modes to suit your preference:
 - **Icons** - Compact view showing application icons
 - **List** - Detailed list view with window titles
 - **Thumbnails** - Visual preview of window contents (requires Screen Recording permission)
 
 <p align="center">
-  <img src=".github/formats.png" alt="Twoggler Modes" width="50%"/>
+  <img src=".github/formats.png" alt="Navi Modes" width="700px" />
 </p>
 
 ## Installing
 
-1. Download `Twoggler.app.zip` from the [Releases page](https://github.com/romulorvs/Twoggler/releases).
-2. Unzip the file.
-3. Drag `Twoggler` to your **Applications** folder.
-4. Open `Twoggler`.
+Run the following command on your terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/romulorvs/Navi/main/install.sh | bash
+```
 
 ## Usage
 
-1. Run the app — you'll see the `Twoggler` icon in the menu bar
+1. Run the app — you'll see the `Navi` icon in the menu bar
 2. Press `Cmd+Tab` to open the switcher and cycle forward
 3. Press `Cmd+Shift+Tab` to cycle backward
 4. Release keys to focus on selected window
@@ -34,18 +38,18 @@ Twoggler offers three display modes to suit your preference:
 
 ## Starting at Login (Recommended)
 
-It is recommended to have Twoggler to start automatically when you log in:
+It is recommended to have Navi to start automatically when you log in:
 
 1. Open **System Settings** → **General** → **Login Items**
 2. Under "Open at Login", click the **+** button
-3. Navigate to `/Applications/Twoggler` and click **Open**
+3. Navigate to `/Applications/Navi` and click **Open**
 
 ## Permissions
 
 On first run, the app will request **Accessibility** permission. You need to:
 
 1. Go to **System Settings** → **Privacy & Security** → **Accessibility**
-2. Enable **Twoggler**
+2. Enable **Navi**
 3. You may need to restart the app after granting permission
 
 If permission is not granted, an alert dialog will appear with a button to open System Settings.
@@ -59,10 +63,10 @@ If permission is not granted, an alert dialog will appear with a button to open 
 ./build.sh
 
 # Copy to Applications
-cp -r .build/Twoggler.app /Applications/
+cp -r .build/Navi.app /Applications/
 
 # Or run directly
-open .build/Twoggler.app
+open .build/Navi.app
 ```
 
 ## Requirements

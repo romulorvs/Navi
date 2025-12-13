@@ -1,8 +1,11 @@
 import Cocoa
 import Carbon
 import ServiceManagement
+import Darwin
+import ScreenCaptureKit
 
 private let kAXWindowNumberAttribute = "AXWindowNumber"
+private let axTrustedPromptKey = "AXTrustedCheckOptionPrompt"
 
 private enum Config {
     static let gridColumns = 5
@@ -17,6 +20,8 @@ private enum Config {
     static let thumbGridIconSize: CGFloat = 210
     static let listItemSize = NSSize(width: 600, height: 32)
 }
+extension WindowManager: @unchecked Sendable {}
+extension HotkeyManager: @unchecked Sendable {}
 
 enum ViewMode: String {
     case grid
@@ -126,6 +131,25 @@ func modifierBitCount(_ flags: CGEventFlags) -> Int {
     modifierInfo.reduce(0) { flags.contains($1.0) ? $0 + 1 : $0 }
 }
 
+final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+    init(_ value: Value) { self.value = value }
+    func withValue<R>(_ update: (inout Value) -> R) -> R {
+        lock.lock(); defer { lock.unlock() }
+        return update(&value)
+    }
+    func get() -> Value {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
+final class WeakBox<Object: AnyObject>: @unchecked Sendable {
+    weak var value: Object?
+    init(_ value: Object?) { self.value = value }
+}
+
 extension CGEventFlags {
     func union(_ other: CGEventFlags) -> CGEventFlags { CGEventFlags(rawValue: rawValue | other.rawValue) }
     func contains(_ required: CGEventFlags) -> Bool { required.rawValue == 0 || (rawValue & required.rawValue) == required.rawValue }
@@ -140,6 +164,105 @@ func keyCodeToString(_ keyCode: Int64) -> String {
         96:"F5", 97:"F6", 98:"F7", 99:"F3", 100:"F8", 101:"F9", 103:"F11", 105:"F13", 107:"F14", 109:"F10", 111:"F12", 113:"F15", 118:"F4", 120:"F2", 122:"F1"
     ]
     return keyNames[keyCode] ?? "Key\(keyCode)"
+}
+
+actor ThumbnailService {
+    static let shared = ThumbnailService()
+
+    private struct Key: Hashable {
+        let windowID: CGWindowID
+        let width: Int
+    }
+
+    private var inFlight: [Key: Task<NSImage?, Never>] = [:]
+
+    private var shareableContentCache: (content: SCShareableContent, fetchedAt: TimeInterval)?
+    private let shareableContentTTL: TimeInterval = 0.5
+
+    private init() {}
+
+    func clear() {
+        inFlight.values.forEach { $0.cancel() }
+        inFlight.removeAll()
+        shareableContentCache = nil
+    }
+
+    func prune(validWindowIDs: Set<CGWindowID>) {
+        if inFlight.isEmpty { return }
+        let staleInFlight = inFlight.keys.filter { !validWindowIDs.contains($0.windowID) }
+        for key in staleInFlight {
+            inFlight[key]?.cancel()
+            inFlight[key] = nil
+        }
+    }
+
+    func thumbnail(windowID: CGWindowID, thumbnailWidth: CGFloat?) async -> NSImage? {
+        guard windowID != 0 else { return nil }
+        let width = thumbnailWidth.map { max(1, Int($0.rounded())) } ?? 0
+        let key = Key(windowID: windowID, width: width)
+
+        // Skip cache - always fetch fresh thumbnails for real-time updates
+        // Join existing in-flight request for the same window/size to avoid duplicate captures
+        if let task = inFlight[key] { return await task.value }
+
+        let task = Task<NSImage?, Never> {
+            defer { Task { self.removeInFlight(key) } }
+            guard !Task.isCancelled else { return nil }
+
+            let content = await self.shareableContent()
+            guard let scWindow = content?.windows.first(where: { $0.windowID == windowID }) else { return nil }
+
+            let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+            let config = SCStreamConfiguration()
+
+            if width > 0 {
+                let aspectRatio = scWindow.frame.height / max(1, scWindow.frame.width)
+                config.width = width
+                config.height = max(1, Int(CGFloat(width) * aspectRatio))
+            } else {
+                config.width = Int(scWindow.frame.width)
+                config.height = Int(scWindow.frame.height)
+            }
+
+            config.scalesToFit = true
+            config.showsCursor = false
+            config.ignoreShadowsDisplay = true
+            config.ignoreShadowsSingleWindow = true
+            config.capturesAudio = false
+            config.captureResolution = .automatic
+
+            do {
+                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                guard !Task.isCancelled else { return nil }
+                let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                // Don't cache - we want fresh captures every refresh
+                return image
+            } catch {
+                return nil
+            }
+        }
+
+        inFlight[key] = task
+        return await task.value
+    }
+
+    private func removeInFlight(_ key: Key) {
+        inFlight[key] = nil
+    }
+
+    private func shareableContent() async -> SCShareableContent? {
+        let now = CFAbsoluteTimeGetCurrent()
+        if let cached = shareableContentCache, (now - cached.fetchedAt) < shareableContentTTL {
+            return cached.content
+        }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            shareableContentCache = (content, now)
+            return content
+        } catch {
+            return shareableContentCache?.content
+        }
+    }
 }
 
 extension NSView {
@@ -166,6 +289,7 @@ extension NSView {
         if let h = h { heightAnchor.constraint(equalToConstant: h).isActive = true }
     }
 }
+@MainActor
 func makeLabel(_ text: String = "", size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = .labelColor, align: NSTextAlignment = .natural) -> NSTextField {
     let l = NSTextField(labelWithString: text)
     l.font = .systemFont(ofSize: size, weight: weight)
@@ -205,6 +329,36 @@ private enum AXHelper {
     }
 }
 
+/// Shared cache for app icons, keyed by bundle identifier to avoid duplicates
+final class AppIconCache: @unchecked Sendable {
+    static let shared = AppIconCache()
+    private let cache = NSCache<NSString, NSImage>()
+    private let lock = NSLock()
+    
+    private init() {
+        cache.countLimit = 50
+    }
+    
+    func icon(for app: NSRunningApplication?) -> NSImage? {
+        guard let app = app else { return nil }
+        let key = (app.bundleIdentifier ?? "\(app.processIdentifier)") as NSString
+        
+        lock.lock()
+        if let cached = cache.object(forKey: key) {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        
+        guard let icon = app.icon else { return nil }
+        
+        lock.lock()
+        cache.setObject(icon, forKey: key)
+        lock.unlock()
+        return icon
+    }
+}
+
 class WindowInfo {
     let ownerPID: pid_t
     let ownerName: String
@@ -213,7 +367,6 @@ class WindowInfo {
     var windowID: CGWindowID = 0
     
     private var _app: NSRunningApplication?
-    private var _appIcon: NSImage?
     private var _isMinimized: Bool?
     private var _isFullScreen: Bool?
     private var _cachedApp = false
@@ -233,18 +386,13 @@ class WindowInfo {
         return _app
     }
     
+    /// Uses shared AppIconCache to avoid duplicate icon storage across windows of the same app
     var appIcon: NSImage? {
-        if _appIcon == nil { _appIcon = app?.icon }
-        return _appIcon
+        AppIconCache.shared.icon(for: app)
     }
     
-    var thumbnail: NSImage? {
-        guard windowID != 0,
-              let cgImage = CGWindowListCreateImage(
-                  .null, .optionIncludingWindow, windowID,
-                  [.boundsIgnoreFraming, .nominalResolution]
-              ) else { return nil }
-        return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+    func loadThumbnail(thumbnailWidth: CGFloat? = nil) async -> NSImage? {
+        await ThumbnailService.shared.thumbnail(windowID: windowID, thumbnailWidth: thumbnailWidth)
     }
     
     var displayTitle: String { windowName.isEmpty ? ownerName : windowName }
@@ -267,20 +415,25 @@ class WindowInfo {
         if AXHelper.getBool(axWindow, kAXMinimizedAttribute) {
             AXHelper.setValue(axWindow, kAXMinimizedAttribute, false as CFTypeRef)
         }
-        app?.activate(options: [.activateIgnoringOtherApps])
+        app?.activate(options: [])
         AXHelper.performAction(axWindow, kAXRaiseAction)
     }
 }
 
-protocol SelectableItemView: NSView {
+extension WindowInfo: @unchecked Sendable {}
+
+@MainActor
+protocol SelectableItemView: AnyObject {
     var isSelected: Bool { get set }
 }
 
 class FloatingTitleView: NSView {
     private let visualEffect = NSVisualEffectView()
     private let backgroundView = NSView()
-    private let titleLabel = makeLabel(size: 13, color: .labelColor, align: .center)
-    private let hPad: CGFloat = 4
+    private let titleLabel = makeLabel(size: 13, color: .labelColor, align: .left)
+    let connectingView = NSVisualEffectView()
+    private let connectingBackgroundView = NSView()
+    private let hPad: CGFloat = 8
     private let vPad: CGFloat = 4
     
     override init(frame: NSRect) {
@@ -295,14 +448,25 @@ class FloatingTitleView: NSView {
         visualEffect.appearance = nil
         visualEffect.state = .active
         visualEffect.wantsLayer = true
+        visualEffect.layer?.borderWidth = 1
         visualEffect.layer?.masksToBounds = true
         
         backgroundView.wantsLayer = true
         backgroundView.layer?.masksToBounds = true
         
-        add(visualEffect)
+        connectingView.material = .hudWindow
+        connectingView.appearance = nil
+        connectingView.state = .active
+        connectingView.wantsLayer = true
+        connectingView.layer?.masksToBounds = true
+        connectingView.isHidden = true
+        
+        connectingBackgroundView.wantsLayer = true
+        connectingBackgroundView.layer?.masksToBounds = true
+        
+        add(visualEffect, connectingView, titleLabel)
         visualEffect.add(backgroundView)
-        visualEffect.add(titleLabel)
+        connectingView.add(connectingBackgroundView)
         visualEffect.pin(to: self)
         backgroundView.pin(to: visualEffect)
         
@@ -328,7 +492,7 @@ class FloatingTitleView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        backgroundView.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.3).cgColor
+        visualEffect.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.4).cgColor
     }
 
     func configure(with title: String) { titleLabel.stringValue = title }
@@ -336,9 +500,15 @@ class FloatingTitleView: NSView {
         let s = titleLabel.sizeThatFits(NSSize(width: maxWidth - hPad * 2, height: CGFloat.greatestFiniteMagnitude))
         return NSSize(width: min(s.width + hPad * 2, maxWidth), height: s.height + vPad * 2)
     }
+    func positionConnectingView(frame: NSRect) {
+        connectingView.frame = frame
+        connectingBackgroundView.frame = NSRect(origin: .zero, size: frame.size)
+        connectingView.isHidden = false
+    }
 }
 
 /// Base class providing common selection/hover tracking functionality
+@MainActor
 class BaseItemView: NSView, SelectableItemView {
     var isSelected: Bool = false { didSet { needsDisplay = true } }
     var onClick: (() -> Void)?
@@ -371,9 +541,12 @@ class WindowItemView: BaseItemView {
     
     private var windowInfo: WindowInfo?
     private var currentWindowID: CGWindowID = 0
+    private var visibleCount: Int = 5
     private var iconSizeConstraints: [NSLayoutConstraint] = []
     private var iconCenterYConstraint: NSLayoutConstraint?
     private var floatingIconConstraints: [NSLayoutConstraint] = []
+
+    private var thumbnailTask: Task<Void, Never>?
     
     static let itemSize = Config.gridItemSize
     static let iconSize = Config.gridIconSize
@@ -486,6 +659,7 @@ class WindowItemView: BaseItemView {
     func configure(with windowInfo: WindowInfo, viewMode: ViewMode = currentViewMode, visibleCount: Int = 5) {
         self.windowInfo = windowInfo
         self.currentWindowID = windowInfo.windowID
+        self.visibleCount = visibleCount
         if viewMode == .thumbnails {
             configureThumbnailsMode(windowInfo, visibleCount: visibleCount)
             minimizedLabel.isHidden = !windowInfo.isMinimized
@@ -505,6 +679,7 @@ class WindowItemView: BaseItemView {
     }
     
     private func configureGridMode(_ windowInfo: WindowInfo) {
+        cancelThumbnailWork()
         iconImageView.image = windowInfo.appIcon
         floatingAppIconView.isHidden = true
         titleLabel.alignment = .center
@@ -520,18 +695,16 @@ class WindowItemView: BaseItemView {
         floatingIconConstraints[0].constant = floatingIconSize
         floatingIconConstraints[1].constant = floatingIconSize
 
-        iconImageView.image = nil
+        // Don't nil the image - keep showing previous thumbnail until new one loads
+        // Only clear if this is a different window than before
+        if currentWindowID != windowID {
+            iconImageView.image = nil
+        }
         floatingAppIconView.image = windowInfo.appIcon
         floatingAppIconView.isHidden = false
         
         if SwitcherWindowController.shared.isVisible && windowID != 0 {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let thumbnail = windowInfo.thumbnail else { return }
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self, self.currentWindowID == windowID, SwitcherWindowController.shared.isVisible else { return }
-                    self.iconImageView.image = thumbnail
-                }
-            }
+            startThumbnailTask(windowInfo: windowInfo, windowID: windowID, visibleCount: visibleCount, force: true)
         }
         titleLabel.alignment = .center
     }
@@ -539,20 +712,47 @@ class WindowItemView: BaseItemView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         if isSelected {
-            layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.3).cgColor
+            layer?.borderWidth = 1
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.4).cgColor
         } else {
-            layer?.backgroundColor = NSColor.clear.cgColor
+            layer?.borderWidth = 0
         }
     }
 
     func refreshThumbnail() {
         guard let windowInfo = windowInfo, currentWindowID != 0 else { return }
-        let windowID = currentWindowID
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let thumbnail = windowInfo.thumbnail else { return }
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, self.currentWindowID == windowID, SwitcherWindowController.shared.isVisible else { return }
-                self.iconImageView.image = thumbnail
+        startThumbnailTask(windowInfo: windowInfo, windowID: currentWindowID, visibleCount: visibleCount, force: false)
+    }
+
+    func cancelThumbnailWork() {
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
+    }
+    
+    /// Releases the thumbnail image to free memory when leaving thumbnails mode
+    func clearThumbnailImage() {
+        cancelThumbnailWork()
+        iconImageView.image = nil
+    }
+
+    private func startThumbnailTask(windowInfo: WindowInfo, windowID: CGWindowID, visibleCount: Int, force: Bool) {
+        guard SwitcherWindowController.shared.isVisible, currentViewMode == .thumbnails else { return }
+        
+        // Cancel any existing task so we can start a fresh one
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
+
+        let weakView = WeakBox(self)
+        let itemSize = WindowItemView.thumbnailItemSize(forVisibleCount: visibleCount)
+        thumbnailTask = Task(priority: .utility) { [weakView] in
+            defer {
+                Task { @MainActor in weakView.value?.thumbnailTask = nil }
+            }
+            guard let thumbnail = await windowInfo.loadThumbnail(thumbnailWidth: itemSize.width) else { return }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let view = weakView.value, view.currentWindowID == windowID, SwitcherWindowController.shared.isVisible else { return }
+                view.iconImageView.image = thumbnail
             }
         }
     }
@@ -606,12 +806,18 @@ class ListItemView: BaseItemView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        layer?.backgroundColor = isSelected ? NSColor.controlAccentColor.withAlphaComponent(0.3).cgColor : NSColor.clear.cgColor
+        if isSelected {
+            layer?.borderWidth = 1
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.4).cgColor
+        } else {
+            layer?.borderWidth = 0
+        }
     }
 }
 
 /// Manages the floating switcher window(s) displayed on all screens.
 /// Handles layout, selection, and display of window items.
+@MainActor
 class SwitcherWindowController {
     static let shared = SwitcherWindowController()
     
@@ -624,6 +830,7 @@ class SwitcherWindowController {
     private var windows: [WindowInfo] = []
     private var selectedIndex = 0
     private var thumbnailRefreshTimer: Timer?
+    private var thumbnailCleanupTimer: Timer?
     private var scrollRowOffset = 0
     private var listScrollOffset = 0
     private var lastHoveredIndex: Int?
@@ -645,12 +852,16 @@ class SwitcherWindowController {
         screenWindows.forEach { $0.orderFrontRegardless() }
         detectInitialMousePosition()
         startThumbnailRefreshTimerIfNeeded()
+        startThumbnailCleanupTimerIfNeeded()
     }
     
     func hide() {
         isVisible = false
         thumbnailRefreshTimer?.invalidate()
         thumbnailRefreshTimer = nil
+        thumbnailCleanupTimer?.invalidate()
+        thumbnailCleanupTimer = nil
+        cancelThumbnailWorkAndClearCache()
         lastHoveredIndex = nil
         (scrollRowOffset, listScrollOffset) = (0, 0)
         screenWindows.forEach { $0.orderOut(nil) }
@@ -686,8 +897,22 @@ class SwitcherWindowController {
     
     func refreshViewMode() {
         guard !windows.isEmpty else { return }
+        if currentViewMode != .thumbnails {
+            clearThumbnailImagesFromViews()
+            cancelThumbnailWorkAndClearCache()
+        }
         updateContent()
         startThumbnailRefreshTimerIfNeeded()
+        startThumbnailCleanupTimerIfNeeded()
+    }
+    
+    /// Clears thumbnail images from all item views to free memory immediately
+    private func clearThumbnailImagesFromViews() {
+        for itemViews in screenItemViews {
+            for view in itemViews {
+                (view as? WindowItemView)?.clearThumbnailImage()
+            }
+        }
     }
     
     private func startThumbnailRefreshTimerIfNeeded() {
@@ -695,8 +920,50 @@ class SwitcherWindowController {
         thumbnailRefreshTimer = nil
         guard isVisible, currentViewMode == .thumbnails else { return }
         thumbnailRefreshTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
-            self?.refreshThumbnails()
+            Task { @MainActor in self?.refreshThumbnails() }
         }
+    }
+
+    private func startThumbnailCleanupTimerIfNeeded() {
+        thumbnailCleanupTimer?.invalidate()
+        thumbnailCleanupTimer = nil
+        guard isVisible, currentViewMode == .thumbnails else { return }
+        thumbnailCleanupTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            Task { @MainActor in
+                let validIDs = self.getVisibleWindowIDs()
+                await ThumbnailService.shared.prune(validWindowIDs: validIDs)
+            }
+        }
+    }
+
+    /// Returns the windowIDs of windows currently visible in the switcher UI
+    private func getVisibleWindowIDs() -> Set<CGWindowID> {
+        guard !windows.isEmpty else { return [] }
+        let startIndex: Int
+        let endIndex: Int
+        
+        if currentViewMode == .list {
+            startIndex = listScrollOffset
+            endIndex = min(startIndex + Config.listMaxItems, windows.count)
+        } else {
+            startIndex = scrollRowOffset * Config.gridColumns
+            let visibleRows = currentViewMode == .thumbnails ? Config.thumbnailMaxRows : Config.gridMaxRows
+            let maxVisible = Config.gridColumns * visibleRows
+            endIndex = min(startIndex + maxVisible, windows.count)
+        }
+        
+        guard startIndex < windows.count else { return [] }
+        return Set(windows[startIndex..<endIndex].map { $0.windowID })
+    }
+
+    private func cancelThumbnailWorkAndClearCache() {
+        for itemViews in screenItemViews {
+            for view in itemViews {
+                (view as? WindowItemView)?.cancelThumbnailWork()
+            }
+        }
+        Task { await ThumbnailService.shared.clear() }
     }
     
     private func refreshThumbnails() {
@@ -957,6 +1224,7 @@ class SwitcherWindowController {
         
         if itemViews.count <= 1 {
             floatingTitle.isHidden = true
+            floatingTitle.connectingView.isHidden = true
             return
         }
         
@@ -964,6 +1232,7 @@ class SwitcherWindowController {
         guard selectedVisibleIndex >= 0, selectedVisibleIndex < itemViews.count,
               let itemView = itemViews[selectedVisibleIndex] as? WindowItemView else {
             floatingTitle.isHidden = true
+            floatingTitle.connectingView.isHidden = true
             return
         }
         
@@ -971,6 +1240,7 @@ class SwitcherWindowController {
         
         guard itemView.isTitleTruncated else {
             floatingTitle.isHidden = true
+            floatingTitle.connectingView.isHidden = true
             return
         }
         
@@ -1000,12 +1270,21 @@ class SwitcherWindowController {
         titleY = max(minY, min(titleY, maxY))
         
         floatingTitle.frame = NSRect(x: titleX, y: titleY, width: titleSize.width, height: titleSize.height)
+        
+        // Position connecting view relative to floatingTitle
+        let itemFrameRelativeToFloatingTitle = NSRect(
+            x: itemView.frame.origin.x - titleX + 1,
+            y: itemView.frame.origin.y - titleY + round(titleSize.height * 0.5),
+            width: itemView.frame.width - 2,
+            height: round(titleSize.height * 0.5) + 1
+        )
+        floatingTitle.positionConnectingView(frame: itemFrameRelativeToFloatingTitle)
     }
 }
 
 /// Manages window enumeration, sorting, and switching.
 /// Uses Accessibility API to get window list and CGWindowList for z-order.
-class WindowManager {
+final class WindowManager {
     static let shared = WindowManager()
     
     private var windowIndex = 0
@@ -1022,25 +1301,35 @@ class WindowManager {
     
     func confirmAndSwitch() {
         isShowingSwitcher = false
-        guard windowIndex >= 0 && windowIndex < cachedWindows.count else { return }
+        guard windowIndex >= 0 && windowIndex < cachedWindows.count else {
+            cachedWindows.removeAll()
+            return
+        }
         let target = cachedWindows[windowIndex]
         lastSwitchedWindowID = target.windowID
-        DispatchQueue.main.async { SwitcherWindowController.shared.hide() }
+        cachedWindows.removeAll()
+        Task { @MainActor in SwitcherWindowController.shared.hide() }
         target.raise()
     }
     
     func switchToWindow(at index: Int) {
         isShowingSwitcher = false
-        guard index >= 0 && index < cachedWindows.count else { return }
+        guard index >= 0 && index < cachedWindows.count else {
+            cachedWindows.removeAll()
+            return
+        }
         windowIndex = index
-        lastSwitchedWindowID = cachedWindows[index].windowID
-        DispatchQueue.main.async { SwitcherWindowController.shared.hide() }
-        cachedWindows[index].raise()
+        let target = cachedWindows[index]
+        lastSwitchedWindowID = target.windowID
+        cachedWindows.removeAll()
+        Task { @MainActor in SwitcherWindowController.shared.hide() }
+        target.raise()
     }
     
     func cancelSwitcher() {
         isShowingSwitcher = false
-        DispatchQueue.main.async { SwitcherWindowController.shared.hide() }
+        cachedWindows.removeAll()
+        Task { @MainActor in SwitcherWindowController.shared.hide() }
     }
     
     func updateSelectedIndex(_ index: Int) {
@@ -1056,8 +1345,10 @@ class WindowManager {
             guard !cachedWindows.isEmpty else { return }
             isShowingSwitcher = true
             windowIndex = delta > 0 ? 1 % cachedWindows.count : (cachedWindows.count - 1) % cachedWindows.count
-            DispatchQueue.main.async {
-                SwitcherWindowController.shared.show(windows: self.cachedWindows, selectedIndex: self.windowIndex)
+            let windows = cachedWindows
+            let index = windowIndex
+            Task { @MainActor in
+                SwitcherWindowController.shared.show(windows: windows, selectedIndex: index)
             }
         } else {
             guard !cachedWindows.isEmpty else {
@@ -1065,7 +1356,10 @@ class WindowManager {
                 return
             }
             windowIndex = (windowIndex + delta + cachedWindows.count) % cachedWindows.count
-            DispatchQueue.main.async { SwitcherWindowController.shared.moveSelection(to: self.windowIndex) }
+            let index = windowIndex
+            Task { @MainActor in
+                SwitcherWindowController.shared.moveSelection(to: index)
+            }
         }
     }
     
@@ -1185,15 +1479,22 @@ class WindowManager {
     }
 }
 
-class HotkeyManager {
+final class HotkeyManager {
     static let shared = HotkeyManager()
     
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var baseComboPressed = false
+    private var activeShortcutConfig = ShortcutConfig.default
     
     private init() {}
     
+    @MainActor
+    func updateShortcutConfig(_ config: ShortcutConfig) {
+        activeShortcutConfig = config
+    }
+    
+    @MainActor
     func start() {
         guard isAccessibilityPermissionGranted() else {
             showAccessibilityAlertIfNeeded(onComplete: { [weak self] in self?.start() })
@@ -1221,6 +1522,7 @@ class HotkeyManager {
         CGEvent.tapEnable(tap: tap, enable: true)
     }
     
+    @MainActor
     func stop() {
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let source = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes) }
@@ -1236,7 +1538,7 @@ class HotkeyManager {
         }
         guard !ShortcutSettingsWindowController.isOpen else { return pass() }
         
-        let config = currentShortcutConfig
+        let config = shared.activeShortcutConfig
         let flags = CGEventFlags(rawValue: event.flags.rawValue & relevantModifierMask.rawValue)
         let baseMods = flags.contains(config.baseModifiers)
         
@@ -1256,13 +1558,13 @@ class HotkeyManager {
         let bwdMatch = flags.rawValue == bwdReq.rawValue && key == config.backwardKey
         
         if bwdMatch {
-            if PermissionDialog.focusIfOpen() { return pass() }
+            if PermissionDialog.requestFocusIfOpen() { return pass() }
             shared.baseComboPressed = true
             WindowManager.shared.showSwitcherAndPrevious()
             return nil
         }
         if fwdMatch {
-            if PermissionDialog.focusIfOpen() { return pass() }
+            if PermissionDialog.requestFocusIfOpen() { return pass() }
             shared.baseComboPressed = true
             WindowManager.shared.showSwitcherAndNext()
             return nil
@@ -1311,6 +1613,7 @@ enum PermissionType {
     var iconName: NSImage.Name { self == .loginItems ? NSImage.applicationIconName : NSImage.cautionName }
     var quitsOnDismiss: Bool { self == .accessibility }
     var closesOnPrimaryAction: Bool { self == .loginItems }
+    @MainActor
     func isGranted() -> Bool {
         switch self {
         case .loginItems: return isLoginItemEnabled()
@@ -1320,9 +1623,10 @@ enum PermissionType {
     }
 }
 
+@MainActor
 private func isAccessibilityPermissionGranted() -> Bool {
     if #available(macOS 10.9, *) {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
+        let options = [axTrustedPromptKey: false] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
     }
     return AXIsProcessTrusted()
@@ -1340,7 +1644,17 @@ private func isScreenRecordingPermissionGranted() -> Bool {
 }
 
 class PermissionDialog: NSObject, NSWindowDelegate {
-    private static var currentDialog: PermissionDialog?
+    @MainActor private static var currentDialog: PermissionDialog?
+    private static let openState = Locked(false)
+    @MainActor private static func updateCurrentDialog(_ dialog: PermissionDialog?) {
+        currentDialog = dialog
+        openState.withValue { $0 = (dialog != nil) }
+    }
+    nonisolated static func requestFocusIfOpen() -> Bool {
+        guard isOpen else { return false }
+        Task { @MainActor in _ = focusIfOpen() }
+        return true
+    }
     
     private var window: NSWindow?
     private let permissionType: PermissionType
@@ -1353,42 +1667,39 @@ class PermissionDialog: NSObject, NSWindowDelegate {
     }
     
     /// Returns true if a permission dialog is currently displayed
-    static var isOpen: Bool { currentDialog != nil }
+    nonisolated static var isOpen: Bool { openState.get() }
     
     /// Focuses the current permission dialog if one is open. Returns true if focused.
     @discardableResult
+    @MainActor
     static func focusIfOpen() -> Bool {
         guard let dialog = currentDialog, let window = dialog.window else { return false }
-        DispatchQueue.main.async {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         return true
     }
     
     /// Shows a permission dialog. If the permission is already granted, calls onComplete immediately.
+    @MainActor
     static func show(_ type: PermissionType, onComplete: (() -> Void)? = nil) {
         if type.isGranted() {
             onComplete?()
             return
         }
-        // Ensure we only ever show a single permission dialog at once and run UI on the main thread
-        DispatchQueue.main.async {
-            if let _ = PermissionDialog.currentDialog {
-                return
-            }
-            let dialog = PermissionDialog(type, onComplete: onComplete)
-            PermissionDialog.currentDialog = dialog
-            dialog.showWindow()
-        }
+        guard PermissionDialog.currentDialog == nil else { return }
+        let dialog = PermissionDialog(type, onComplete: onComplete)
+        PermissionDialog.updateCurrentDialog(dialog)
+        dialog.showWindow()
     }
     
+    @MainActor
     private func showWindow() {
         if window == nil { createWindow() }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
     
+    @MainActor
     private func createWindow() {
         let (w, h, margin, btnW, btnH) = (CGFloat(320), CGFloat(330), CGFloat(20), CGFloat(180), CGFloat(32))
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: w, height: h), styleMask: [.titled], backing: .buffered, defer: false)
@@ -1425,6 +1736,7 @@ class PermissionDialog: NSObject, NSWindowDelegate {
         content.add(iconView, titleLabel, secondaryButton, primaryButton, infoLabel)
     }
     
+    @MainActor
     @objc private func primaryClicked() {
         if permissionType == .loginItems {
             if #available(macOS 13.0, *) {
@@ -1447,18 +1759,22 @@ class PermissionDialog: NSObject, NSWindowDelegate {
         }
     }
     
+    @MainActor
     @objc private func secondaryClicked() {
         window?.close()
     }
     
+    @MainActor
     func windowDidBecomeKey(_ notification: Notification) {
         if permissionType.isGranted() {
             window?.close()
         }
     }
     
+    @MainActor
     func windowWillClose(_ notification: Notification) {
         window = nil
+        PermissionDialog.updateCurrentDialog(nil)
         let granted = permissionType.isGranted()
         let completion = onComplete
         onComplete = nil
@@ -1479,22 +1795,24 @@ class PermissionDialog: NSObject, NSWindowDelegate {
     }
 }
 
+@MainActor
 private func showLoginItemsPromptIfNeeded(onComplete: @escaping () -> Void) {
     PermissionDialog.show(.loginItems, onComplete: onComplete)
 }
 
+@MainActor
 private func showAccessibilityAlertIfNeeded(onComplete: (() -> Void)? = nil) {
     PermissionDialog.show(.accessibility, onComplete: onComplete)
 }
 
+@MainActor
 private func showScreenRecordingAlert() {
-    DispatchQueue.main.async {
-        PermissionDialog.show(.screenRecording)
-    }
+    PermissionDialog.show(.screenRecording)
 }
 
+@MainActor
 class ShortcutSettingsWindowController: NSObject, NSWindowDelegate {
-    static var isOpen = false
+    nonisolated(unsafe) static var isOpen = false
     
     private var window: NSWindow?
     private var baseModifiersField: ShortcutCaptureField!
@@ -1647,7 +1965,7 @@ class ShortcutSettingsWindowController: NSObject, NSWindowDelegate {
     private func updateWarning() {
         let config = buildConfig()
         if config.conflictsWithSystemShortcuts {
-            warningLabel.stringValue = "⚠️ Current combinations may occasionally conflict with macOS default shortcuts."
+            warningLabel.stringValue = "⚠️ Current hotkeys may occasionally conflict with macOS default shortcuts."
         } else {
             warningLabel.stringValue = ""
         }
@@ -1692,6 +2010,7 @@ class ShortcutSettingsWindowController: NSObject, NSWindowDelegate {
         let config = buildConfig()
         currentShortcutConfig = config
         config.save()
+        HotkeyManager.shared.updateShortcutConfig(config)
         onSave?()
         window?.close()
     }
@@ -1862,6 +2181,7 @@ class ShortcutCaptureField: NSTextField {
     }
 }
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var shortcutSettingsController: ShortcutSettingsWindowController?
@@ -1873,6 +2193,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             UserDefaults.standard.set(ViewMode.grid.rawValue, forKey: "viewMode")
         }
         
+        HotkeyManager.shared.updateShortcutConfig(currentShortcutConfig)
+
         setupStatusBar()
         
         // Show login items prompt first (if not already enabled), then start hotkey manager
@@ -1927,7 +2249,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     
     func menuWillOpen(_ menu: NSMenu) {
-        if PermissionDialog.focusIfOpen() {
+        if PermissionDialog.requestFocusIfOpen() {
             menu.cancelTracking()
             return
         }

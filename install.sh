@@ -13,12 +13,12 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Check macOS version (requires 12.0+)
+# Check macOS version (requires 14.0+)
 MACOS_VERSION=$(sw_vers -productVersion)
 MACOS_MAJOR=$(echo "$MACOS_VERSION" | cut -d. -f1)
 
-if [ "$MACOS_MAJOR" -lt 12 ]; then
-    echo -e "${RED}Error: Navi requires macOS 12.0 (Monterey) or later.${NC}"
+if [ "$MACOS_MAJOR" -lt 14 ]; then
+    echo -e "${RED}Error: Navi requires macOS 14.0 or later.${NC}"
     echo "Your version: macOS $MACOS_VERSION"
     exit 1
 fi

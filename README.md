@@ -71,5 +71,5 @@ open .build/Navi.app
 
 ## Requirements
 
-- macOS 12.0 or later
+- macOS 14.0 or later
 - Accessibility permission (required for hotkeys and window management)

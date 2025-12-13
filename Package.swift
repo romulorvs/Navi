@@ -4,16 +4,20 @@ import PackageDescription
 let package = Package(
     name: "Navi",
     platforms: [
-        .macOS(.v12)
+        .macOS(.v14)
     ],
     targets: [
         .executableTarget(
             name: "Navi",
+            dependencies: [],
             path: ".",
-            exclude: ["Info.plist", "build.sh", "install.sh", "README.md"],
+            exclude: ["build.sh", "install.sh", "README.md", "Info.plist", "LICENSE", "PrivacyInfo.xcprivacy"],
             sources: ["main.swift"],
             resources: [
                 .copy("icon.png")
+            ],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
             ]
         )
     ]

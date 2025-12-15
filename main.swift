@@ -428,11 +428,9 @@ protocol SelectableItemView: AnyObject {
 }
 
 class FloatingTitleView: NSView {
-    private let visualEffect = NSVisualEffectView()
-    private let backgroundView = NSView()
-    private let titleLabel = makeLabel(size: 13, color: .labelColor, align: .left)
-    let connectingView = NSVisualEffectView()
-    private let connectingBackgroundView = NSView()
+    private let view = NSView()
+    let connectingView = NSView()
+    private let titleLabel = makeLabel(size: 13, color: .white, align: .left)
     private let hPad: CGFloat = 8
     private let vPad: CGFloat = 4
     
@@ -444,31 +442,15 @@ class FloatingTitleView: NSView {
     
     private func setupViews() {
         wantsLayer = true
-        visualEffect.material = .hudWindow
-        visualEffect.appearance = nil
-        visualEffect.state = .active
-        visualEffect.wantsLayer = true
-        visualEffect.layer?.borderWidth = 1
-        visualEffect.layer?.masksToBounds = true
-        
-        backgroundView.wantsLayer = true
-        backgroundView.layer?.masksToBounds = true
-        
-        connectingView.material = .hudWindow
-        connectingView.appearance = nil
-        connectingView.state = .active
+        view.wantsLayer = true
         connectingView.wantsLayer = true
         connectingView.layer?.masksToBounds = true
+        connectingView.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
         connectingView.isHidden = true
+        view.layer?.cornerRadius = Config.windowItemCornerRadius
         
-        connectingBackgroundView.wantsLayer = true
-        connectingBackgroundView.layer?.masksToBounds = true
-        
-        add(visualEffect, connectingView, titleLabel)
-        visualEffect.add(backgroundView)
-        connectingView.add(connectingBackgroundView)
-        visualEffect.pin(to: self)
-        backgroundView.pin(to: visualEffect)
+        add(view, connectingView, titleLabel)
+        view.pin(to: self)
         
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -486,13 +468,21 @@ class FloatingTitleView: NSView {
 
     override func layout() {
         super.layout()
-        visualEffect.layer?.cornerRadius = Config.windowItemCornerRadius
-        backgroundView.layer?.cornerRadius = Config.windowItemCornerRadius
+        // Update shadow path based on new bounds
+        view.layer?.shadowPath = CGPath(roundedRect: view.bounds, cornerWidth: Config.windowItemCornerRadius, cornerHeight: Config.windowItemCornerRadius, transform: nil)
     }
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        visualEffect.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.4).cgColor
+        view.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        view.layer?.shadowColor = NSColor.black.cgColor
+        view.layer?.shadowOpacity = 0.4
+        view.layer?.shadowRadius = 2
+        view.layer?.shadowOffset = CGSize(width: 0, height: -2)
+        view.layer?.masksToBounds = false
+        view.layer?.shadowPath = CGPath(roundedRect: view.bounds, cornerWidth: Config.windowItemCornerRadius, cornerHeight: Config.windowItemCornerRadius, transform: nil)
+        view.layer?.borderWidth = 1
+        view.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.25).cgColor
     }
 
     func configure(with title: String) { titleLabel.stringValue = title }
@@ -502,7 +492,6 @@ class FloatingTitleView: NSView {
     }
     func positionConnectingView(frame: NSRect) {
         connectingView.frame = frame
-        connectingBackgroundView.frame = NSRect(origin: .zero, size: frame.size)
         connectingView.isHidden = false
     }
 }
@@ -712,10 +701,32 @@ class WindowItemView: BaseItemView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         if isSelected {
+            layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+            layer?.masksToBounds = false
+            layer?.shadowColor = NSColor.black.cgColor
+            layer?.shadowOpacity = 0.4
+            layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: Config.windowItemCornerRadius, cornerHeight: Config.windowItemCornerRadius, transform: nil)
             layer?.borderWidth = 1
-            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.4).cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.25).cgColor
+
+            if isTitleTruncated {
+                layer?.shadowRadius = 0
+                layer?.shadowOffset = CGSize(width: 0, height: 0)
+            } else {
+                layer?.shadowRadius = 2
+                layer?.shadowOffset = CGSize(width: 0, height: -2)
+            }
+            titleLabel.textColor = NSColor.white
         } else {
+            layer?.backgroundColor = NSColor.clear.cgColor
+            layer?.shadowOpacity = 0
+            layer?.shadowRadius = 0
+            layer?.shadowOffset = .zero
+            layer?.shadowColor = nil
+            layer?.shadowPath = nil
+            layer?.masksToBounds = true
             layer?.borderWidth = 0
+            titleLabel.textColor = NSColor.labelColor
         }
     }
 
@@ -807,10 +818,28 @@ class ListItemView: BaseItemView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         if isSelected {
+            layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+            layer?.masksToBounds = false
+            layer?.shadowColor = NSColor.black.cgColor
+            layer?.shadowOpacity = 0.4
+            layer?.shadowRadius = 1
+            layer?.shadowOffset = CGSize(width: 0, height: -1)
+            layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: Config.windowItemCornerRadius, cornerHeight: Config.windowItemCornerRadius, transform: nil)
             layer?.borderWidth = 1
-            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.4).cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.25).cgColor
+            titleLabel.textColor = NSColor.white
+            appNameLabel.textColor = NSColor.white
         } else {
+            layer?.backgroundColor = NSColor.clear.cgColor
+            layer?.shadowColor = nil
+            layer?.shadowOpacity = 0
+            layer?.shadowRadius = 0
+            layer?.shadowOffset = .zero
+            layer?.shadowPath = nil
+            layer?.masksToBounds = true
             layer?.borderWidth = 0
+            titleLabel.textColor = NSColor.labelColor
+            appNameLabel.textColor = NSColor.secondaryLabelColor
         }
     }
 }
@@ -1270,13 +1299,13 @@ class SwitcherWindowController {
         titleY = max(minY, min(titleY, maxY))
         
         floatingTitle.frame = NSRect(x: titleX, y: titleY, width: titleSize.width, height: titleSize.height)
-        
+
         // Position connecting view relative to floatingTitle
         let itemFrameRelativeToFloatingTitle = NSRect(
             x: itemView.frame.origin.x - titleX + 1,
             y: itemView.frame.origin.y - titleY + round(titleSize.height * 0.5),
             width: itemView.frame.width - 2,
-            height: round(titleSize.height * 0.5) + 1
+            height: round(titleSize.height * 0.5) + 2
         )
         floatingTitle.positionConnectingView(frame: itemFrameRelativeToFloatingTitle)
     }
